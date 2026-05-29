@@ -1,4 +1,5 @@
 import 'dart:math';
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 
@@ -125,8 +126,13 @@ class _StoneDiePainter extends CustomPainter {
                 .transform((t - _tumbleEnd) / (1 - _tumbleEnd))
                 .clamp(0.0, 1.0);
 
-    // Contact shadow (stays put — die is on-axis).
-    final shadowK = 0.55 + 0.45 * settleP;
+    // Die rises during tumble, then falls back to rest.
+    final liftFactor = tumbling ? sin(pi * (t / _tumbleEnd)) : 0.0;
+    final riseAmp = radius * 0.55;
+    final dieCenter = center + Offset(0, -riseAmp * liftFactor);
+
+    // Contact shadow shrinks and spreads as die lifts.
+    final shadowK = (0.55 + 0.45 * settleP) * (1 - 0.5 * liftFactor);
     canvas.drawOval(
       Rect.fromCenter(
         center: center + Offset(0, radius * 1.35),
@@ -135,7 +141,8 @@ class _StoneDiePainter extends CustomPainter {
       ),
       Paint()
         ..color = Colors.black.withValues(alpha: 0.5 * shadowK)
-        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 22),
+        ..maskFilter =
+            MaskFilter.blur(BlurStyle.normal, 22 + 28 * liftFactor),
     );
 
     if (!rolling) {
@@ -145,15 +152,34 @@ class _StoneDiePainter extends CustomPainter {
 
     if (tumbling) {
       final p = t / _tumbleEnd;
-      // Trailing ghosts for motion blur, each a little behind in angle.
+      // Ghost trails — subtle background blur, mostly for motion feel.
       const ghosts = 6;
-      for (var i = ghosts; i >= 0; i--) {
-        final lag = i * 0.04;
+      for (var i = ghosts; i >= 1; i--) {
+        final lag = i * 0.08;
         final pp = (p - lag).clamp(0.0, 1.0);
-        final a = (i == 0) ? 1.0 : 0.16 + 0.12 * (1 - i / ghosts);
-        _drawDie(canvas, center, radius, sides, _angle(pp),
+        final blurSigma = i * 0.9; // reduced — ghosts are soft but not smeared
+        final a = 0.10 + 0.09 * (1 - i / ghosts);
+        canvas.saveLayer(
+          null,
+          Paint()
+            ..imageFilter =
+                ui.ImageFilter.blur(sigmaX: blurSigma, sigmaY: blurSigma),
+        );
+        _drawDie(canvas, dieCenter, radius, sides, _angle(pp),
             alpha: a, face: null);
+        canvas.restore();
       }
+      // Main die — strongly blurred at peak speed, clears as it decelerates.
+      final spinBlur = 5.0 * (1 - p);
+      canvas.saveLayer(
+        null,
+        Paint()
+          ..imageFilter =
+              ui.ImageFilter.blur(sigmaX: spinBlur, sigmaY: spinBlur),
+      );
+      _drawDie(canvas, dieCenter, radius, sides, _angle(p),
+          alpha: 1.0, face: null);
+      canvas.restore();
       return;
     }
 
@@ -161,12 +187,12 @@ class _StoneDiePainter extends CustomPainter {
     final s = settleP;
     final bounce = (1 - s) * 0.16 * sin(t * 30);
     canvas.save();
-    canvas.translate(center.dx, center.dy);
+    canvas.translate(dieCenter.dx, dieCenter.dy);
     canvas.transform((Matrix4.identity()
           ..scaleByDouble(1 + bounce, 1 - bounce, 1, 1))
         .storage);
-    canvas.translate(-center.dx, -center.dy);
-    _drawDie(canvas, center, radius * (0.94 + 0.06 * s), sides,
+    canvas.translate(-dieCenter.dx, -dieCenter.dy);
+    _drawDie(canvas, dieCenter, radius * (0.94 + 0.06 * s), sides,
         (1 - s) * 0.12 * sin(t * 34),
         alpha: 1, face: result);
     canvas.restore();
@@ -211,6 +237,28 @@ class _StoneDiePainter extends CustomPainter {
     return path..close();
   }
 
+  // Cuts each corner of a regular polygon inward by [ch] pixels.
+  Path _chamferedPolyPath(
+      Offset center, double r, int sides, double rotation, double ch) {
+    final pts = List.generate(sides, (i) {
+      final a = rotation - pi / 2 + i * 2 * pi / sides;
+      return center + Offset(cos(a), sin(a)) * r;
+    });
+    final path = Path();
+    for (var i = 0; i < sides; i++) {
+      final prev = pts[(i + sides - 1) % sides];
+      final curr = pts[i];
+      final next = pts[(i + 1) % sides];
+      final toPrev = (prev - curr) / (prev - curr).distance;
+      final toNext = (next - curr) / (next - curr).distance;
+      final p1 = curr + toPrev * ch;
+      final p2 = curr + toNext * ch;
+      i == 0 ? path.moveTo(p1.dx, p1.dy) : path.lineTo(p1.dx, p1.dy);
+      path.lineTo(p2.dx, p2.dy);
+    }
+    return path..close();
+  }
+
   void _drawCube(Canvas canvas, Offset center, double r, double rotation,
       double alpha, RollResult? face) {
     Offset v(int i) {
@@ -221,19 +269,23 @@ class _StoneDiePainter extends CustomPainter {
     final c = center;
     final v0 = v(0), v1 = v(1), v2 = v(2), v3 = v(3), v4 = v(4), v5 = v(5);
 
-    Path f(Offset a, Offset b, Offset d, Offset e) => Path()
+    Path fPath(Offset a, Offset b, Offset d, Offset e) => Path()
       ..moveTo(a.dx, a.dy)
       ..lineTo(b.dx, b.dy)
       ..lineTo(d.dx, d.dy)
       ..lineTo(e.dx, e.dy)
       ..close();
 
-    final topF = f(c, v5, v0, v1);
-    final leftF = f(c, v5, v4, v3);
-    final rightF = f(c, v1, v2, v3);
+    final topF = fPath(c, v5, v0, v1);
+    final leftF = fPath(c, v5, v4, v3);
+    final rightF = fPath(c, v1, v2, v3);
 
+    final ch = r * 0.09;
+    final chamfHex = _chamferedPolyPath(center, r, 6, rotation, ch);
+
+    // Shadow cast by chamfered shape.
     canvas.drawPath(
-      _polyPath(center, r, 6, rotation).shift(const Offset(0, 6)),
+      chamfHex.shift(const Offset(0, 6)),
       Paint()
         ..color = Colors.black.withValues(alpha: 0.35 * alpha)
         ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 10),
@@ -247,18 +299,12 @@ class _StoneDiePainter extends CustomPainter {
         colors: [a.withValues(alpha: alpha), b.withValues(alpha: alpha)],
       ).createShader(rect);
 
+    // Faces + ridge lines clipped to chamfered boundary.
+    canvas.save();
+    canvas.clipPath(chamfHex);
     canvas.drawPath(topF, fill(const Color(0xFFC2C7CD), const Color(0xFFA5ABB3)));
     canvas.drawPath(leftF, fill(const Color(0xFF8C929B), const Color(0xFF6E747D)));
     canvas.drawPath(rightF, fill(const Color(0xFF5C616A), const Color(0xFF44484F)));
-
-    canvas.drawPath(
-      _polyPath(center, r, 6, rotation),
-      Paint()
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 2.0
-        ..strokeJoin = StrokeJoin.round
-        ..color = const Color(0xFF24262A).withValues(alpha: alpha),
-    );
     canvas.drawPath(
       Path()
         ..moveTo(c.dx, c.dy)
@@ -282,13 +328,29 @@ class _StoneDiePainter extends CustomPainter {
         ..strokeWidth = 1.6
         ..color = Colors.white.withValues(alpha: 0.22 * alpha),
     );
+    canvas.restore();
+
+    // Chamfered outline drawn last so it sits cleanly on top.
+    canvas.drawPath(
+      chamfHex,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2.0
+        ..strokeJoin = StrokeJoin.round
+        ..color = const Color(0xFF24262A).withValues(alpha: alpha),
+    );
 
     if (face != null && face.die == DieType.d6) {
-      _drawFacePips(canvas, c, v5 - c, v3 - c, face.value, r, alpha);
+      final top = face.value;
+      final left = (top % 6) + 1;
+      final right = ((top + 1) % 6) + 1;
+      _drawFacePips(canvas, c, v5 - c, v1 - c, top, r, alpha);
+      _drawFacePips(canvas, c, v5 - c, v3 - c, left, r, alpha);
+      _drawFacePips(canvas, c, v1 - c, v3 - c, right, r, alpha);
     }
   }
 
-  /// Draws d6 pips ON the left face: the face is the parallelogram with origin
+  /// Draws d6 pips on a face defined by origin [c] and edge vectors [ax]/[bx].
   /// [c] and axes [ax] (c→v5) and [bx] (c→v3). Pips are placed in face-local
   /// (u,v) space and the same affine maps them to skewed ellipses, so they sit
   /// flat on the angled face instead of looking like flat circles.
@@ -362,7 +424,8 @@ class _StoneDiePainter extends CustomPainter {
 
   void _drawPolygon(Canvas canvas, Offset center, double r, int sides,
       double rotation, double alpha, RollResult? face) {
-    final body = _polyPath(center, r, sides, rotation);
+    final ch = r * 0.06;
+    final body = _chamferedPolyPath(center, r, sides, rotation, ch);
     final rect = Rect.fromCircle(center: center, radius: r);
 
     canvas.drawPath(
@@ -400,7 +463,7 @@ class _StoneDiePainter extends CustomPainter {
         ).createShader(rect),
     );
     canvas.drawPath(
-      _polyPath(center, r * 0.965, sides, rotation),
+      _chamferedPolyPath(center, r * 0.965, sides, rotation, ch * 0.965),
       Paint()
         ..style = PaintingStyle.stroke
         ..strokeWidth = r * 0.05
